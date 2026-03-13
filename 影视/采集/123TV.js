@@ -1,6 +1,10 @@
+// @name 123TV
 /**
  * ============================================================================
- * 123TV资源 - OmniBox 爬虫脚本 (T3→T4转换版)
+ * 123TV
+ * 刮削：支持
+ * 弹幕：支持
+ * 嗅探：支持
  * ============================================================================
  */
 const axios = require("axios");
@@ -18,6 +22,9 @@ const axiosInstance = axios.create({
     httpsAgent: new https.Agent({ rejectUnauthorized: false }),
     timeout: 15000
 });
+
+// 弹幕API配置
+const DANMU_API = process.env.DANMU_API || '';
 
 /**
  * 日志工具函数
@@ -56,6 +63,147 @@ const buildScrapedEpisodeName = (scrapeData, mapping, originalName) => {
     return originalName;
 };
 
+// ========== 弹幕相关函数 ==========
+
+/**
+ * 预处理标题,去掉常见干扰项
+ */
+function preprocessTitle(title) {
+    if (!title) return '';
+    return title
+        .replace(/4[kK]|[xX]26[45]|720[pP]|1080[pP]|2160[pP]/g, ' ')
+        .replace(/[hH]\.?26[45]/g, ' ')
+        .replace(/BluRay|WEB-DL|HDR|REMUX/gi, ' ')
+        .replace(/\.mp4|\.mkv|\.avi|\.flv/gi, ' ');
+}
+
+/**
+ * 将中文数字转换为阿拉伯数字
+ */
+function chineseToArabic(cn) {
+    const map = { '零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
+    if (!isNaN(cn)) return parseInt(cn, 10);
+    if (cn.length === 1) return map[cn] || cn;
+    if (cn.length === 2) {
+        if (cn[0] === '十') return 10 + map[cn[1]];
+        if (cn[1] === '十') return map[cn[0]] * 10;
+    }
+    if (cn.length === 3) return map[cn[0]] * 10 + map[cn[2]];
+    return cn;
+}
+
+/**
+ * 从标题中提取集数数字
+ */
+function extractEpisode(title) {
+    if (!title) return '';
+    const processedTitle = preprocessTitle(title).trim();
+
+    // 1. 中文格式:第XX集/话
+    const cnMatch = processedTitle.match(/第\s*([零一二三四五六七八九十0-9]+)\s*[集话章节回期]/);
+    if (cnMatch) return String(chineseToArabic(cnMatch[1]));
+
+    // 2. S01E03 格式
+    const seMatch = processedTitle.match(/[Ss](?:\d{1,2})?[-._\s]*[Ee](\d{1,3})/i);
+    if (seMatch) return seMatch[1];
+
+    // 3. EP/E 格式
+    const epMatch = processedTitle.match(/\b(?:EP|E)[-._\s]*(\d{1,3})\b/i);
+    if (epMatch) return epMatch[1];
+
+    // 4. 括号格式 [03]
+    const bracketMatch = processedTitle.match(/[\[\(【(](\d{1,3})[\]\)】)]/);
+    if (bracketMatch) {
+        const num = bracketMatch[1];
+        if (!['720', '1080', '480'].includes(num)) return num;
+    }
+
+    return '';
+}
+
+/**
+ * 构建用于弹幕匹配的文件名
+ */
+function buildFileNameForDanmu(vodName, episodeTitle) {
+    if (!vodName) return '';
+    if (!episodeTitle || episodeTitle === '正片' || episodeTitle === '播放') {
+        return vodName;
+    }
+    const digits = extractEpisode(episodeTitle);
+    if (digits) {
+        const epNum = parseInt(digits, 10);
+        if (epNum > 0) {
+            return epNum < 10 ? `${vodName} S01E0${epNum}` : `${vodName} S01E${epNum}`;
+        }
+    }
+    return vodName;
+}
+
+function buildScrapedDanmuFileName(scrapeData, scrapeType, mapping, fallbackVodName, fallbackEpisodeName) {
+    if (!scrapeData) {
+        return buildFileNameForDanmu(fallbackVodName, fallbackEpisodeName);
+    }
+    if (scrapeType === 'movie') {
+        return scrapeData.title || fallbackVodName;
+    }
+    const title = scrapeData.title || fallbackVodName;
+    const seasonAirYear = scrapeData.seasonAirYear || '';
+    const seasonNumber = mapping?.seasonNumber || 1;
+    const episodeNumber = mapping?.episodeNumber || 1;
+    return `${title}.${seasonAirYear}.S${String(seasonNumber).padStart(2, '0')}E${String(episodeNumber).padStart(2, '0')}`;
+}
+
+/**
+ * 匹配弹幕
+ */
+async function matchDanmu(fileName) {
+    if (!DANMU_API || !fileName) return [];
+    try {
+        logInfo(`匹配弹幕: ${fileName}`);
+        const matchUrl = `${DANMU_API}/api/v2/match`;
+        const response = await OmniBox.request(matchUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            },
+            body: JSON.stringify({ fileName })
+        });
+
+        if (response.statusCode !== 200) {
+            logInfo(`弹幕匹配失败: HTTP ${response.statusCode}`);
+            return [];
+        }
+
+        const matchData = JSON.parse(response.body || '{}');
+        if (!matchData.isMatched) {
+            logInfo('弹幕未匹配到');
+            return [];
+        }
+
+        const matches = matchData.matches || [];
+        if (matches.length === 0) return [];
+
+        const firstMatch = matches[0];
+        const episodeId = firstMatch.episodeId;
+        const animeTitle = firstMatch.animeTitle || '';
+        const episodeTitle = firstMatch.episodeTitle || '';
+        if (!episodeId) return [];
+
+        let danmakuName = '弹幕';
+        if (animeTitle && episodeTitle) danmakuName = `${animeTitle} - ${episodeTitle}`;
+        else if (animeTitle) danmakuName = animeTitle;
+        else if (episodeTitle) danmakuName = episodeTitle;
+
+        const danmakuURL = `${DANMU_API}/api/v2/comment/${episodeId}?format=xml`;
+        logInfo(`弹幕匹配成功: ${danmakuName}`);
+        return [{ name: danmakuName, url: danmakuURL }];
+    } catch (error) {
+        logInfo(`弹幕匹配失败: ${error.message}`);
+        return [];
+    }
+}
+
 /**
  * 图像地址修复
  */
@@ -63,6 +211,28 @@ const fixPicUrl = (url) => {
     if (!url) return '';
     if (url.startsWith('http')) return url;
     return url.startsWith('//') ? `https:${url}` : `https://${url}`;
+};
+
+/**
+ * 嗅探播放页，兜底提取真实视频地址
+ */
+const sniff123tvPlay = async (playUrl) => {
+    if (!playUrl) return null;
+    try {
+        logInfo("尝试嗅探播放页", playUrl);
+        const sniffed = await OmniBox.sniffVideo(playUrl);
+        if (sniffed && sniffed.url) {
+            logInfo("嗅探成功", sniffed.url);
+            return {
+                urls: [{ name: "嗅探线路", url: sniffed.url }],
+                parse: 0,
+                header: sniffed.header || { ...def_headers, Referer: playUrl }
+            };
+        }
+    } catch (error) {
+        logInfo(`嗅探失败: ${error.message}`);
+    }
+    return null;
 };
 
 /**
@@ -122,35 +292,45 @@ async function home(params) {
             // { 'type_id': '15', 'type_name': '福利' }
         ],
         filters: {
-            '10': [{"key": "class", "name": "类型", "value": [
-                {"name": "全部", "value": ""}, {"name": "动作片", "value": "1001"}, {"name": "喜剧片", "value": "1002"},
-                {"name": "爱情片", "value": "1003"}, {"name": "科幻片", "value": "1004"}, {"name": "恐怖片", "value": "1005"},
-                {"name": "剧情片", "value": "1006"}, {"name": "战争片", "value": "1007"}, {"name": "纪录片", "value": "1008"},
-                {"name": "动漫电影", "value": "1010"}, {"name": "奇幻片", "value": "1011"}, {"name": "动画片", "value": "1013"},
-                {"name": "犯罪片", "value": "1014"}, {"name": "悬疑片", "value": "1016"}, {"name": "邵氏电影", "value": "1019"},
-                {"name": "歌舞片", "value": "1022"}, {"name": "家庭片", "value": "1024"}, {"name": "古装片", "value": "1025"},
-                {"name": "历史片", "value": "1026"}, {"name": "4K电影", "value": "1027"}
-            ]}],
-            '11': [{"key": "class", "name": "地区", "value": [
-                {"name": "全部", "value": ""}, {"name": "国产剧", "value": "1101"}, {"name": "香港剧", "value": "1102"},
-                {"name": "台湾剧", "value": "1105"}, {"name": "韩国剧", "value": "1103"}, {"name": "欧美剧", "value": "1104"},
-                {"name": "日本剧", "value": "1106"}, {"name": "泰国剧", "value": "1108"}, {"name": "港台剧", "value": "1110"},
-                {"name": "日韩剧", "value": "1111"}, {"name": "海外剧", "value": "1107"}
-            ]}],
-            '12': [{"key": "class", "name": "类型", "value": [
-                {"name": "全部", "value": ""}, {"name": "内地综艺", "value": "1201"}, {"name": "港台综艺", "value": "1202"},
-                {"name": "日韩综艺", "value": "1203"}, {"name": "欧美综艺", "value": "1204"}, {"name": "国外综艺", "value": "1205"}
-            ]}],
-            '13': [{"key": "class", "name": "类型", "value": [
-                {"name": "全部", "value": ""}, {"name": "国产动漫", "value": "1301"}, {"name": "日韩动漫", "value": "1302"},
-                {"name": "欧美动漫", "value": "1303"}, {"name": "海外动漫", "value": "1305"}, {"name": "里番", "value": "1307"}
-            ]}],
-            '15': [{"key": "class", "name": "分类", "value": [
-                {"name": "全部", "value": ""}, {"name": "韩国情色片", "value": "1551"}, {"name": "日本情色片", "value": "1552"},
-                {"name": "大陆情色片", "value": "1555"}, {"name": "香港情色片", "value": "1553"}, {"name": "台湾情色片", "value": "1554"},
-                {"name": "美国情色片", "value": "1556"}, {"name": "欧洲情色片", "value": "1557"}, {"name": "印度情色片", "value": "1558"},
-                {"name": "东南亚情色片", "value": "1559"}, {"name": "其它情色片", "value": "1550"}
-            ]}]
+            '10': [{
+                "key": "class", "name": "类型", "value": [
+                    { "name": "全部", "value": "" }, { "name": "动作片", "value": "1001" }, { "name": "喜剧片", "value": "1002" },
+                    { "name": "爱情片", "value": "1003" }, { "name": "科幻片", "value": "1004" }, { "name": "恐怖片", "value": "1005" },
+                    { "name": "剧情片", "value": "1006" }, { "name": "战争片", "value": "1007" }, { "name": "纪录片", "value": "1008" },
+                    { "name": "动漫电影", "value": "1010" }, { "name": "奇幻片", "value": "1011" }, { "name": "动画片", "value": "1013" },
+                    { "name": "犯罪片", "value": "1014" }, { "name": "悬疑片", "value": "1016" }, { "name": "邵氏电影", "value": "1019" },
+                    { "name": "歌舞片", "value": "1022" }, { "name": "家庭片", "value": "1024" }, { "name": "古装片", "value": "1025" },
+                    { "name": "历史片", "value": "1026" }, { "name": "4K电影", "value": "1027" }
+                ]
+            }],
+            '11': [{
+                "key": "class", "name": "地区", "value": [
+                    { "name": "全部", "value": "" }, { "name": "国产剧", "value": "1101" }, { "name": "香港剧", "value": "1102" },
+                    { "name": "台湾剧", "value": "1105" }, { "name": "韩国剧", "value": "1103" }, { "name": "欧美剧", "value": "1104" },
+                    { "name": "日本剧", "value": "1106" }, { "name": "泰国剧", "value": "1108" }, { "name": "港台剧", "value": "1110" },
+                    { "name": "日韩剧", "value": "1111" }, { "name": "海外剧", "value": "1107" }
+                ]
+            }],
+            '12': [{
+                "key": "class", "name": "类型", "value": [
+                    { "name": "全部", "value": "" }, { "name": "内地综艺", "value": "1201" }, { "name": "港台综艺", "value": "1202" },
+                    { "name": "日韩综艺", "value": "1203" }, { "name": "欧美综艺", "value": "1204" }, { "name": "国外综艺", "value": "1205" }
+                ]
+            }],
+            '13': [{
+                "key": "class", "name": "类型", "value": [
+                    { "name": "全部", "value": "" }, { "name": "国产动漫", "value": "1301" }, { "name": "日韩动漫", "value": "1302" },
+                    { "name": "欧美动漫", "value": "1303" }, { "name": "海外动漫", "value": "1305" }, { "name": "里番", "value": "1307" }
+                ]
+            }],
+            '15': [{
+                "key": "class", "name": "分类", "value": [
+                    { "name": "全部", "value": "" }, { "name": "韩国情色片", "value": "1551" }, { "name": "日本情色片", "value": "1552" },
+                    { "name": "大陆情色片", "value": "1555" }, { "name": "香港情色片", "value": "1553" }, { "name": "台湾情色片", "value": "1554" },
+                    { "name": "美国情色片", "value": "1556" }, { "name": "欧洲情色片", "value": "1557" }, { "name": "印度情色片", "value": "1558" },
+                    { "name": "东南亚情色片", "value": "1559" }, { "name": "其它情色片", "value": "1550" }
+                ]
+            }]
         },
         list: []
     };
@@ -162,28 +342,28 @@ async function home(params) {
 async function category(params) {
     const { categoryId, page, filters } = params;
     const pg = parseInt(page) || 1;
-    
+
     // 处理筛选参数
     let tid = categoryId;
     if (filters && filters.class) {
         tid = filters.class;
     }
-    
-    const url = pg === 1 
-        ? `${host}/t/${tid}.html` 
+
+    const url = pg === 1
+        ? `${host}/t/${tid}.html`
         : `${host}/t/${tid}/p${pg}.html`;
-    
+
     logInfo(`请求分类: ${tid}, 页码: ${pg}, URL: ${url}`);
-    
+
     try {
         const res = await axiosInstance.get(url, { headers: def_headers });
         const html = res.data;
-        
+
         // 解析视频列表
         const regex = /<a class="w4-item" href="([^"]+)".*?<img.*?data-src="([^"]+)".*?<div class="s">.*?<span>([^<]+)<\/span>.*?<div class="t"[^>]*title="([^"]+)">.*?<div class="i">([^<]+)<\/div>/gs;
         const videos = [];
         let match;
-        
+
         while ((match = regex.exec(html)) !== null) {
             videos.push({
                 vod_id: match[1],
@@ -192,7 +372,7 @@ async function category(params) {
                 vod_remarks: match[3].trim()
             });
         }
-        
+
         // 解析总页数
         const pageRegex = /\/p(\d+)\.html"[^>]*>(\d+)<\/a>/g;
         let maxPage = pg;
@@ -200,9 +380,9 @@ async function category(params) {
         while ((pageMatch = pageRegex.exec(html)) !== null) {
             maxPage = Math.max(maxPage, parseInt(pageMatch[2]));
         }
-        
+
         logInfo(`分类结果: ${videos.length}条, 总页数: ${maxPage}`);
-        
+
         return {
             list: videos,
             page: pg,
@@ -220,23 +400,23 @@ async function category(params) {
 async function search(params) {
     const wd = params.keyword || params.wd || "";
     const pg = parseInt(params.page) || 1;
-    
+
     const encodedKw = encodeURIComponent(wd);
-    const url = pg === 1 
-        ? `${host}/s/${encodedKw}.html` 
+    const url = pg === 1
+        ? `${host}/s/${encodedKw}.html`
         : `${host}/s/${encodedKw}/p${pg}.html`;
-    
+
     logInfo(`搜索关键词: ${wd}, 页码: ${pg}, URL: ${url}`);
-    
+
     try {
         const res = await axiosInstance.get(url, { headers: def_headers });
         const html = res.data;
-        
+
         // 解析搜索结果
         const regex = /<a class="w4-item" href="([^"]+)".*?<img.*?data-src="([^"]+)".*?<div class="t"[^>]*>([^<]+)<\/div>.*?<div class="i">([^<]+)<\/div>/gs;
         const videos = [];
         let match;
-        
+
         while ((match = regex.exec(html)) !== null) {
             videos.push({
                 vod_id: match[1],
@@ -245,9 +425,9 @@ async function search(params) {
                 vod_remarks: match[4].trim()
             });
         }
-        
+
         logInfo(`搜索结果: ${videos.length}条`);
-        
+
         return {
             list: videos,
             page: pg,
@@ -266,13 +446,13 @@ async function search(params) {
 async function detail(params) {
     const videoId = params.videoId;
     const url = videoId.startsWith('http') ? videoId : `${host}${videoId}`;
-    
+
     logInfo(`请求详情: ${videoId}, URL: ${url}`);
-    
+
     try {
         const res = await axiosInstance.get(url, { headers: def_headers });
         const html = res.data;
-        
+
         const vod = {
             vod_id: videoId,
             vod_name: '',
@@ -285,31 +465,31 @@ async function detail(params) {
             vod_director: '',
             vod_content: ''
         };
-        
+
         // 解析标题
         const titleMatch = html.match(/<li class="on"><h1>([^<]+)<\/h1><\/li>/);
         if (titleMatch) vod.vod_name = titleMatch[1];
-        
+
         // 解析封面
         const picMatch = html.match(/data-poster="([^"]+)"/);
         if (picMatch) vod.vod_pic = fixPicUrl(picMatch[1]);
-        
+
         // 解析描述和演员信息
         const descMatch = html.match(/name="description" content="(.*?)"/);
         if (descMatch) {
             const content = descMatch[1];
             vod.vod_content = content;
-            
+
             const actorMatch = content.match(/演员:(.*?)(。|$)/);
             if (actorMatch) vod.vod_actor = actorMatch[1];
-            
+
             const areaMatch = content.match(/地区:(.*?)(。|$)/);
             if (areaMatch) vod.vod_area = areaMatch[1];
-            
+
             const directorMatch = content.match(/导演:(.*?)(。|$)/);
             if (directorMatch) vod.vod_director = directorMatch[1];
         }
-        
+
         // 解析播放源数据 [2]
         const scriptMatch = html.match(/var pp=({.*?});/s);
         if (scriptMatch) {
@@ -318,31 +498,31 @@ async function detail(params) {
                 const vno = ppData.no;
                 const playFromArr = [];
                 const playUrlArr = [];
-                
+
                 for (const line of ppData.la || []) {
                     const [lineId, lineName, episodeCount] = line;
                     const episodes = [];
-                    
+
                     for (let i = 0; i < episodeCount; i++) {
                         episodes.push(`第${i + 1}集$/v/${vno}/${lineId}z${i}.html`);
                     }
-                    
+
                     if (episodes.length > 0) {
                         playFromArr.push(lineName);
                         playUrlArr.push(episodes.join('#'));
                     }
                 }
-                
+
                 // T3格式数据
                 const vodPlayFrom = playFromArr.join('$$$');
                 const vodPlayUrl = playUrlArr.join('$$$');
-                
+
                 // 转换为T4格式 [1]
                 vod.vod_play_sources = parsePlaySources(vodPlayFrom, vodPlayUrl, videoId, vod.vod_name);
-                
-                logInfo("播放源解析完成", { 
-                    fromCount: playFromArr.length, 
-                    sources: vod.vod_play_sources.length 
+
+                logInfo("播放源解析完成", {
+                    fromCount: playFromArr.length,
+                    sources: vod.vod_play_sources.length
                 });
 
                 const scrapeCandidates = [];
@@ -415,7 +595,7 @@ async function detail(params) {
                 logError("解析播放源数据失败", e);
             }
         }
-        
+
         return { list: [vod] };
     } catch (e) {
         logError("详情获取失败", e);
@@ -433,9 +613,13 @@ async function play(params) {
     const playId = rawPlayId || rawInputPlayId;
     const url = `${host}${playId}`;
     const vodId = params.vodId || meta.sid || '';
-    
+
+    let vodName = meta.v || '';
+    const episodeName = meta.fid || '';
+    let scrapedDanmuFileName = '';
+
     logInfo(`准备播放: ${playId}, URL: ${url}`);
-    
+
     try {
         if (vodId) {
             const sourceId = `spider_source_${await OmniBox.getSourceId()}_${vodId}`;
@@ -445,27 +629,65 @@ async function play(params) {
                 hit: !!(metadata && metadata.data),
                 episode: meta.fid || ''
             });
+
+            if (metadata && metadata.scrapeData) {
+                const mapping = (metadata.videoMappings || []).find((m) => m?.fileId === meta?.fid);
+                scrapedDanmuFileName = buildScrapedDanmuFileName(
+                    metadata.scrapeData,
+                    metadata.scrapeType || '',
+                    mapping,
+                    vodName,
+                    episodeName
+                );
+                if (metadata.scrapeData.title) {
+                    vodName = metadata.scrapeData.title;
+                }
+            }
         }
 
         const res = await axiosInstance.get(url, { headers: def_headers });
         const html = res.data;
-        
+
         // 解析真实播放地址
         const match = html.match(/data-src="([^"]+)"/);
         if (match) {
             const playUrl = match[1];
             logInfo(`解析到播放地址: ${playUrl}`);
-            
-            return {
-                urls: [{ name: "默认", url: playUrl }],
+
+            const response = {
+                urls: [{ name: '默认', url: playUrl }],
                 parse: 0,
                 header: def_headers
             };
+
+            if (DANMU_API && (vodName || meta.v)) {
+                const fallbackVodName = meta.v || vodName;
+                const fileName = scrapedDanmuFileName || buildFileNameForDanmu(fallbackVodName, episodeName);
+                logInfo(`尝试匹配弹幕文件名: ${fileName}`);
+                if (fileName) {
+                    const danmakuList = await matchDanmu(fileName);
+                    if (danmakuList && danmakuList.length > 0) {
+                        response.danmaku = danmakuList;
+                        logInfo('弹幕已添加到播放响应');
+                    }
+                }
+            }
+
+            return response;
+        }
+
+        const sniffResult = await sniff123tvPlay(url);
+        if (sniffResult) {
+            return sniffResult;
         }
     } catch (e) {
         logError("解析播放地址失败", e);
+        const fallbackSniff = await sniff123tvPlay(url);
+        if (fallbackSniff) {
+            return fallbackSniff;
+        }
     }
-    
+
     return {
         urls: [{ name: "默认", url: "" }],
         parse: 0,
